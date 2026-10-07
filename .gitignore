@@ -1,0 +1,23 @@
+.env
+creds.txt
+state.json
+app.zip
+__pycache__/
+*.pyc
+.venv/
+backup
+.DS_Store
+
+# Cargo build output (built libs are copied to miwigu/wg_host/dist/)
+target/
+
+# Local WireGuard private keys
+*.key
+miwigu/wg_host/windows-dummy.conf
+
+# Compiled wstoudp binary
+miwigu/wstoudp/wstoudp
+miwigu/wstoudp/wstoudp.exe
+
+# Local lwIP build; guest copies live in miwigu/wg_host/dist/
+miwigu/wg_host/lwip_port/*.so

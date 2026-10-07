@@ -1,0 +1,11 @@
+[package]
+name = "tunn_ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+base64 = "0.22"
+boringtun = "0.7.1"
