@@ -1,119 +1,133 @@
-# AWS Lambda MicroVM Sandbox
+# miwigu
 
-A place for Grant Jones to experiment with AWS Lambda MicroVMs.
+WireGuard over an [AWS Lambda MicroVM](https://docs.aws.amazon.com/lambda/latest/dg/lambda-microvms-guide.html) WebSocket.
 
-Documentation:
-- [Lambda MicroVMs overview](https://docs.aws.amazon.com/lambda/latest/dg/lambda-microvms-guide.html)
-- [How it works / core concepts](https://docs.aws.amazon.com/lambda/latest/dg/microvms-how-it-works.html)
-- [Getting started tutorial](https://docs.aws.amazon.com/lambda/latest/dg/microvms-getting-started.html)
-
----
-
-## What's in this repo
+A MicroVM only accepts authenticated HTTPS and WebSocket traffic. WireGuard speaks UDP, so a client cannot use the MicroVM endpoint as its `Endpoint`. miwigu carries the tunnel over that WebSocket: a proxy beside the WireGuard client, and a guest inside the MicroVM that terminates the tunnel and answers on ordinary TCP.
 
 ```
-aws_lambda_microvm_sandbox/
-├── config.py                   # Shared constants — edit before running
-├── requirements.txt
-├── app/
-│   ├── app.js                  # Node.js HTTP + WebSocket terminal server (port 8080)
-│   ├── package.json            # ws + node-pty dependencies
-│   └── Dockerfile
-└── scripts/
-    ├── 01_setup_iam.py         # Create IAM build role
-    ├── 02_upload_artifact.py   # Zip & upload app/ to S3
-    ├── 03_create_image.py      # Build MicroVM image, poll until ready
-    ├── 04_run_microvm.py       # Launch a MicroVM, poll until RUNNING
-    ├── 05_connect.py           # Get auth token, hit the endpoint
-    ├── 06_terminate.py         # Terminate MicroVM and clean up
-    └── 07_terminal.py          # Open a web terminal connected to the MicroVM
+WireGuard client                 10.200.99.2
+    UDP 127.0.0.1:51820
+        │
+        ▼
+wstoudp                          local proxy
+    one datagram per WebSocket frame, plus the Lambda auth token
+        │
+        ▼
+Lambda MicroVM proxy
+        │
+        ▼
+wg_host                          guest, 10.200.99.1
+    BoringTun → lwIP → TCP
+        ├── :80   HTTP, body "success"
+        └── :22   SSH, prints "success"
 ```
 
----
+The client's WireGuard config points at `127.0.0.1:51820`, which is `wstoudp`.
 
-## Prerequisites
+- [How MicroVMs work](https://docs.aws.amazon.com/lambda/latest/dg/microvms-how-it-works.html)
+- [Getting started](https://docs.aws.amazon.com/lambda/latest/dg/microvms-getting-started.html)
 
-1. An existing **S3 bucket** in your target region.
-2. AWS credentials configured locally (`~/.aws/credentials` or environment variables) with permissions to create IAM roles and access S3.
-3. The `lambda-microvms` service available in your chosen region.
+## Layout
 
----
+```
+├── config.py                 # S3 bucket, region, image name, idle policy
+├── Makefile                  # wstoudp binaries, guest libraries, app.zip
+├── miwigu/
+│   ├── wstoudp/              # WireGuard UDP ↔ WebSocket
+│   └── wg_host/              # guest: WebSocket → BoringTun → lwIP → TCP
+├── scripts/                  # create the image, run it, print a wstoudp command
+├── local/                    # same guest, in Docker, for a local wstoudp
+└── tools/docker-wireguard-test/   # Linux WireGuard client aimed at wstoudp
+```
 
-## Setup
+## wstoudp
+
+`miwigu/wstoudp` listens on `127.0.0.1:51820`. Each WireGuard UDP datagram becomes one WebSocket binary message, and each reply is written back to the client.
+
+```bash
+./wstoudp -url wss://<endpoint>/ -token <token>
+```
+
+`-listen` changes the UDP address. Ctrl-C stops the proxy; the WireGuard client keeps using `127.0.0.1:51820`.
+
+`make wstoudp` builds it into `bin/<os>-<arch>/`. Linux and macOS get a command-line program. The Windows build is a small GUI (`wstoudp.exe`) and needs `wstoudp.exe.manifest` beside it.
+
+## wg_host
+
+`miwigu/wg_host` is the guest image. Lambda forwards the WebSocket to `wg_host_listener.py` on port 8080. BoringTun (`tunn_ffi`) decrypts each frame, and lwIP (`lwip_port`) turns the inner packets into TCP connections to the two processes `start.sh` starts:
+
+- port 80 — an HTTP server that returns `success`
+- port 22 — an SSH server that prints `success` and exits
+
+`http://10.200.99.1/` or an SSH session to `10.200.99.1` is how you tell the tunnel is up.
+
+The WireGuard private key is not copied into the image. `scripts/04_run_microvm.py` reads `miwigu/wg_host/server.key` (not committed) and sends it in the run-hook payload. The listener creates the tunnel only after `POST /aws/lambda-microvms/runtime/v1/run`, so the key is not captured in the image snapshot. The accepted peer is the public key of the Windows dummy tunnel, hardcoded in that script.
+
+Prebuilt aarch64 libraries are in `miwigu/wg_host/dist/`. Rebuild them on Linux with `make libs`, or with `miwigu/wg_host/build-aarch64.sh`. That needs `gcc` and `aarch64-linux-gnu-gcc`.
+
+## Build
+
+```bash
+make wstoudp     # bin/<os>-<arch>/wstoudp
+make libs        # BoringTun and lwIP .so files for aarch64 and x86_64 (Linux)
+make artifact    # app.zip, the guest Docker context scripts/02 uploads
+make check
+```
+
+`make libs` cross-compiles. On macOS, `make wstoudp` and `make artifact` are enough when the committed `dist/` libraries are still good.
+
+## Run it on AWS
+
+1. An S3 bucket in the target region.
+2. AWS credentials that can create IAM roles and write that bucket.
+3. `lambda-microvms` available in that region.
+4. `miwigu/wg_host/server.key`, the guest private key.
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Open `config.py` and set at minimum:
+Set `S3_BUCKET` and `AWS_REGION` in `config.py`, or export `MICROVM_S3_BUCKET` and `AWS_DEFAULT_REGION`.
 
-| Variable | Description |
-|---|---|
-| `S3_BUCKET` | Your S3 bucket name (or set `MICROVM_S3_BUCKET` env var) |
-| `AWS_REGION` | Target region (or set `AWS_DEFAULT_REGION` env var) |
-
----
-
-## Running the walkthrough
-
-Run the scripts in order from the repo root:
+From the repo root:
 
 ```bash
-# 1. Create the IAM build role (idempotent — safe to run again)
-python scripts/01_setup_iam.py
-
-# 2. Package app/ and upload to S3
-python scripts/02_upload_artifact.py
-
-# 3. Build the MicroVM image (takes a few minutes)
-python scripts/03_create_image.py
-
-# 4. Launch a MicroVM and wait for it to reach RUNNING
-python scripts/04_run_microvm.py
-
-# 5. Create an auth token and send a test request
-python scripts/05_connect.py
-
-# 6. Terminate the MicroVM and release all resources
-python scripts/06_terminate.py
+python scripts/01_setup_iam.py        # IAM build role; safe to repeat
+python scripts/02_upload_artifact.py  # zip miwigu/wg_host and upload it
+python scripts/03_create_image.py     # build the MicroVM image
+python scripts/04_run_microvm.py      # launch it; writes state.json
+python scripts/05_connect.py          # print: ./wstoudp -url wss://... -token ...
+python scripts/06_terminate.py        # terminate and delete state.json
 ```
 
-`state.json` is created by script 04 and read by scripts 05, 06, and 07. It is deleted on termination.
+Script 04 reads `server.key` and waits until the MicroVM is `RUNNING`. Script 05 prints a `wstoudp` command with a fresh auth token. Start `wstoudp` with that command, bring up a WireGuard peer for `10.200.99.2` whose endpoint is `127.0.0.1:51820`, then request `http://10.200.99.1/`.
 
----
-
-## Web terminal
-
-Script 07 opens an interactive browser-based terminal connected to a shell running inside the MicroVM:
-
-```bash
-python scripts/07_terminal.py
-```
-
-This starts a local proxy server at `http://localhost:8765` and opens your browser automatically. The proxy:
-
-1. Fetches a short-lived AWS auth token via boto3
-2. Serves an [xterm.js](https://xtermjs.org/) terminal page in your browser
-3. Accepts WebSocket connections from the browser and forwards them to the MicroVM, injecting the `X-aws-proxy-auth` header (browsers cannot set this header themselves on WebSocket upgrade requests)
-
-The MicroVM app (`app/app.js`) runs a PTY-backed `bash` session on the WebSocket endpoint `wss://{endpoint}/ws`. Terminal resize events are propagated automatically.
-
-> **Note:** If you previously built the MicroVM image before adding the terminal, you must rebuild it to pick up the new app:
-> ```bash
-> python scripts/02_upload_artifact.py   # re-upload with package.json included
-> python scripts/03_create_image.py      # rebuild the image
-> python scripts/04_run_microvm.py       # launch a new MicroVM
-> ```
-
----
-
-## MicroVM lifecycle
+`config.py` suspends the MicroVM after 15 minutes idle and resumes it when traffic arrives. A MicroVM that stays suspended for 5 minutes is terminated.
 
 ```
 PENDING → RUNNING → SUSPENDING → SUSPENDED
-                ↑_________________________↑  (auto-resume on traffic)
+                ↑_________________________↑
 RUNNING / SUSPENDED → TERMINATING → TERMINATED
 ```
 
-The idle policy in `config.py` suspends the MicroVM after 15 minutes of
-inactivity and auto-resumes it when traffic arrives.
+## Try it locally
+
+`local/Dockerfile` builds the same guest and serves it on port 8080, with a front door that accepts the MicroVM WebSocket subprotocols. Any non-empty token works.
+
+```bash
+docker build -f local/Dockerfile -t local-runner .
+docker run --rm -p 8080:8080 local-runner
+```
+
+The listener prints a WireGuard client config. Point `wstoudp` at `ws://127.0.0.1:8080/` and use that config, whose endpoint is `127.0.0.1:51820`.
+
+`tools/docker-wireguard-test` is a Linux WireGuard client whose peer endpoint is `wstoudp` on the host. Start `wstoudp` on `0.0.0.0:51820` first; Docker cannot send to loopback.
+
+```bash
+./wstoudp -listen 0.0.0.0:51820 -url ws://127.0.0.1:8080/ -token local
+docker build -t wg-test tools/docker-wireguard-test
+docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
+  --add-host=host.docker.internal:host-gateway \
+  -e WG_PRIVATE_KEY="<client private key>" \
+  wg-test
+```
