@@ -15,7 +15,8 @@ target/
 *.key
 miwigu/wg_host/windows-dummy.conf
 
-# Compiled wstoudp binary
+# Compiled wstoudp binaries (make wstoudp)
+bin/
 miwigu/wstoudp/wstoudp
 miwigu/wstoudp/wstoudp.exe
 
