@@ -29,9 +29,20 @@
 
 static char host_dest[64] = HOST_ADDR;
 
-/* The host process owns these: the WebSocket listener and the lifecycle hooks. */
+/* guacd connects here. lwIP then dials the WireGuard peer. */
+static int dial_enabled = 1;
+static int dial_listen_fd = -1;
+static char dial_listen_host[64] = "127.0.0.1";
+static unsigned dial_listen_port = 3389;
+static char dial_dest_host[64] = "10.200.99.2";
+static unsigned dial_dest_port = 3389;
+static ip4_addr_t dial_dest_ip;
+
+/* The host process owns these: the WebSocket listener and the lifecycle hooks.
+   The dial listen port is blocked so a peer connection to that port on
+   10.200.99.1 cannot loop back into the dialer. */
 int lwip_port_blocked(u16_t port) {
-    return port == 8080 || port == 9000;
+    return port == 8080 || port == 9000 || (dial_enabled && port == (u16_t)dial_listen_port);
 }
 
 static void load_host_dest(void) {
@@ -41,7 +52,7 @@ static void load_host_dest(void) {
     }
 }
 #define MAX_PKT 2048
-#define IO_CAP 16384
+#define IO_CAP 65535
 #define MAX_FLOWS 8
 #define LOG_SLOTS 64
 #define LOG_LEN 160
@@ -458,9 +469,177 @@ static int listen_any(const ip4_addr_t *addr) {
     return 0;
 }
 
+static int parse_host_port(const char *text, char *host, size_t host_cap, unsigned *port) {
+    const char *colon = strrchr(text, ':');
+    if (colon == NULL || colon == text) {
+        return -1;
+    }
+    size_t n = (size_t)(colon - text);
+    if (n == 0 || n >= host_cap) {
+        return -1;
+    }
+    memcpy(host, text, n);
+    host[n] = '\0';
+    char *end = NULL;
+    long value = strtol(colon + 1, &end, 10);
+    if (end == colon + 1 || *end != '\0' || value <= 0 || value > 65535) {
+        return -1;
+    }
+    *port = (unsigned)value;
+    return 0;
+}
+
+static int load_dial(void) {
+    const char *listen = getenv("WG_DIAL_LISTEN");
+    const char *dest = getenv("WG_DIAL_DEST");
+    if (listen != NULL && (listen[0] == '\0' || strcmp(listen, "off") == 0)) {
+        dial_enabled = 0;
+        return 0;
+    }
+    if (listen != NULL &&
+        parse_host_port(listen, dial_listen_host, sizeof(dial_listen_host), &dial_listen_port) != 0) {
+        note("WG_DIAL_LISTEN is not host:port");
+        return -1;
+    }
+    if (dest != NULL &&
+        parse_host_port(dest, dial_dest_host, sizeof(dial_dest_host), &dial_dest_port) != 0) {
+        note("WG_DIAL_DEST is not host:port");
+        return -1;
+    }
+    if (!ip4addr_aton(dial_dest_host, &dial_dest_ip)) {
+        note("dial destination is not ipv4");
+        return -1;
+    }
+    return 0;
+}
+
+static err_t dial_connected(void *arg, struct tcp_pcb *pcb, err_t err) {
+    struct flow *f = arg;
+    LWIP_UNUSED_ARG(pcb);
+    LWIP_UNUSED_ARG(err);
+    if (!flow_alive(f)) {
+        return ERR_OK;
+    }
+    note("rdp peer connected");
+    settle(f);
+    if (!flow_alive(f)) {
+        return aborted_pcb ? ERR_ABRT : ERR_OK;
+    }
+    return ERR_OK;
+}
+
+static void start_dial(int fd) {
+    int slot = -1;
+    for (int i = 0; i < MAX_FLOWS; i++) {
+        if (flows[i] == NULL) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        note("no room for a dialed connection");
+        close(fd);
+        return;
+    }
+    struct flow *f = calloc(1, sizeof(*f));
+    struct tcp_pcb *pcb = tcp_new();
+    if (f == NULL || pcb == NULL) {
+        note("dial out of memory");
+        if (pcb != NULL) {
+            tcp_abort(pcb);
+        }
+        free(f);
+        close(fd);
+        return;
+    }
+    f->fd = fd;
+    f->in = pcb;
+    f->host_port = dial_dest_port;
+    flows[slot] = f;
+    tcp_arg(pcb, f);
+    tcp_err(pcb, in_err);
+    tcp_recv(pcb, in_recv);
+    tcp_sent(pcb, in_sent);
+    tcp_nagle_disable(pcb);
+    tcp_bind_netif(pcb, &wg_netif);
+    char msg[160];
+    snprintf(msg, sizeof(msg), "dialing %s:%u", dial_dest_host, dial_dest_port);
+    note(msg);
+    err_t e = tcp_connect(pcb, &dial_dest_ip, (u16_t)dial_dest_port, dial_connected);
+    if (e != ERR_OK) {
+        note("dial tcp_connect failed");
+        destroy_flow(f, 1);
+    }
+}
+
+static void accept_dials(void) {
+    if (dial_listen_fd < 0) {
+        return;
+    }
+    for (;;) {
+        int fd = accept(dial_listen_fd, NULL, NULL);
+        if (fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return;
+        }
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) {
+            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        }
+        int clo = fcntl(fd, F_GETFD, 0);
+        if (clo >= 0) {
+            fcntl(fd, F_SETFD, clo | FD_CLOEXEC);
+        }
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        start_dial(fd);
+    }
+}
+
+static int listen_dial(void) {
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        note("dial socket failed");
+        return -1;
+    }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(fd);
+        note("dial socket flags failed");
+        return -1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)dial_listen_port);
+    if (inet_pton(AF_INET, dial_listen_host, &addr.sin_addr) != 1) {
+        close(fd);
+        note("dial listen address is not ipv4");
+        return -1;
+    }
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 8) < 0) {
+        close(fd);
+        note("dial listen failed");
+        return -1;
+    }
+    dial_listen_fd = fd;
+    char msg[160];
+    snprintf(msg, sizeof(msg), "dial %s:%u -> %s:%u", dial_listen_host, dial_listen_port,
+             dial_dest_host, dial_dest_port);
+    note(msg);
+    return 0;
+}
+
 int lwip_startup(void) {
     char msg[160];
     load_host_dest();
+    if (load_dial() != 0) {
+        return -1;
+    }
     lwip_init();
     ip4_addr_t addr;
     ip4_addr_t mask;
@@ -476,6 +655,9 @@ int lwip_startup(void) {
     netif_set_default(&wg_netif);
 
     if (listen_any(&addr) != 0) {
+        return -1;
+    }
+    if (dial_enabled && listen_dial() != 0) {
         return -1;
     }
     snprintf(msg, sizeof(msg), "lwIP listening on " WG_ADDR ", host socket -> %s:<same port>",
@@ -498,6 +680,7 @@ int lwip_inject(const uint8_t *ip, uint32_t len) {
 }
 
 void lwip_poll(void) {
+    accept_dials();
     struct pollfd pf[MAX_FLOWS];
     int map[MAX_FLOWS];
     int n = 0;

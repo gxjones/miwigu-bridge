@@ -30,17 +30,17 @@
 #define LWIP_NETIF_LOOPBACK 0
 
 #define MEM_ALIGNMENT 4
-#define MEM_SIZE (128 * 1024)
+#define MEM_SIZE (256 * 1024)
 #define MEMP_NUM_PBUF 64
 #define MEMP_NUM_TCP_PCB 16
 #define MEMP_NUM_TCP_PCB_LISTEN 4
-#define MEMP_NUM_TCP_SEG 128
+#define MEMP_NUM_TCP_SEG 256
 #define PBUF_POOL_SIZE 64
 
 #define TCP_MSS 1200
-#define TCP_SND_BUF (8 * TCP_MSS)
-#define TCP_WND (8 * TCP_MSS)
-#define TCP_SND_QUEUELEN 32
+#define TCP_SND_BUF (32 * TCP_MSS)
+#define TCP_WND (32 * TCP_MSS)
+#define TCP_SND_QUEUELEN 128
 #define LWIP_TCP_TIMESTAMPS 0
 
 #define LWIP_STATS 0

@@ -5,6 +5,7 @@ app.zip
 __pycache__/
 *.pyc
 .venv/
+node_modules/
 backup
 .DS_Store
 

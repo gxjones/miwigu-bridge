@@ -7,6 +7,7 @@ and writes the microvmId + endpoint to state.json for subsequent scripts.
 
 import json
 import os
+import secrets
 import sys
 import time
 import boto3
@@ -28,6 +29,8 @@ TERMINAL_OR_RUNNING = {"RUNNING", "TERMINATING", "TERMINATED"}
 WG_HOST_DIR = os.path.join(os.path.dirname(__file__), "..", "miwigu", "wg_host")
 # Public key of the Windows dummy tunnel (windows-dummy.conf Interface PrivateKey).
 WINDOWS_PEER_PUBLIC_KEY = "GHhBnw7IqG3OcOcjH7lE3xXVOsNLH64SWpofim1wkE8="
+# 32-byte AES key for guacamole-lite. Minted here and stored in state.json.
+GUAC_CRYPT_KEY = secrets.token_hex(16)
 
 
 def run_hook_payload() -> str:
@@ -42,6 +45,7 @@ def run_hook_payload() -> str:
             "serverPrivateKey": private,
             "peerPublicKey": WINDOWS_PEER_PUBLIC_KEY,
             "hostAddr": "127.0.0.1",
+            "guacCryptKey": GUAC_CRYPT_KEY,
         }
     )
 
@@ -68,6 +72,19 @@ def main():
     endpoint = response.get("endpoint", "")
     print(f"MicroVM ID : {microvm_id}")
     print(f"Endpoint   : {endpoint}")
+
+    # Write this before polling. The run hook already has the guacamole key,
+    # and a later interrupt should not throw that key away.
+    state_data = {
+        "microvmId": microvm_id,
+        "endpoint": endpoint,
+        "region": AWS_REGION,
+        "guacCryptKey": GUAC_CRYPT_KEY,
+    }
+    state_path = os.path.join(os.path.dirname(__file__), "..", STATE_FILE)
+    with open(state_path, "w") as f:
+        json.dump(state_data, f, indent=2)
+
     print("Polling until RUNNING...\n")
 
     while True:
@@ -84,19 +101,10 @@ def main():
         print(f"\nMicroVM ended up in unexpected state: {state}")
         sys.exit(1)
 
-    # Persist identifiers for the connect and terminate scripts.
-    state_data = {
-        "microvmId": microvm_id,
-        "endpoint": endpoint,
-        "region": AWS_REGION,
-    }
-    state_path = os.path.join(os.path.dirname(__file__), "..", STATE_FILE)
-    with open(state_path, "w") as f:
-        json.dump(state_data, f, indent=2)
-
     print(f"\nMicroVM is RUNNING.")
     print(f"Endpoint : https://{endpoint}/")
     print(f"State    : written to {STATE_FILE}")
+    print("Guacamole key is in that file. scripts/08_guacamole.py reads it.")
 
 
 if __name__ == "__main__":

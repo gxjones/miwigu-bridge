@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """WebSocket listener for the forwarded MicroVM connection.
 
+lwIP also listens on 127.0.0.1:3389 and dials the WireGuard peer, so guacd
+can RDP to that address.
+
 Lambda's proxy connects to this process. It binds 0.0.0.0:8080, accepts a
 normal WebSocket upgrade (the Lambda subprotocols have already been removed),
 and turns each binary frame into a WireGuard datagram for BoringTun, then
-lwIP, then a host socket.
+lwIP, then a host socket. Each connection is handled on its own thread. One
+BoringTun session is live at a time; a new finished handshake replaces it.
 
 Lifecycle hooks listen on 0.0.0.0:9000. In microvm mode the WireGuard keys
 are not created until POST /aws/lambda-microvms/runtime/v1/run, so they are
@@ -37,11 +41,14 @@ LOG = os.environ.get("WG_HOST_LOG", str(ROOT / "wg-host-listener.log"))
 TUNN_LIB = os.environ.get("TUNN_LIB", str(ROOT / "tunn_ffi" / "target" / "release" / "libtunn_ffi.so"))
 LWIP_LIB = os.environ.get("LWIP_LIB", str(ROOT / "lwip_port" / "liblwip_port.so"))
 OUR_ADDR = "10.200.99.1"
+GUAC_CRYPT_FILE = os.environ.get("GUAC_CRYPT_FILE", "/tmp/guac-crypt.key")
 # Public key of the Windows dummy tunnel (windows-dummy.conf PrivateKey).
 PEER_PUBLIC = os.environ.get(
     "WG_PEER_PUBLIC", "GHhBnw7IqG3OcOcjH7lE3xXVOsNLH64SWpofim1wkE8="
 ).encode()
 HOOK_PREFIX = "/aws/lambda-microvms/runtime/v1"
+# Drop a connection that never completes the upgrade. wstoudp gives up at 10s.
+HANDSHAKE_TIMEOUT = float(os.environ.get("WG_HANDSHAKE_TIMEOUT", "5"))
 
 DONE = 0
 WRITE_TO_NETWORK = 1
@@ -57,15 +64,19 @@ class WgResult(ctypes.Structure):
     _fields_ = [("op", ctypes.c_uint32), ("size", ctypes.c_uint64)]
 
 
+log_lock = threading.Lock()
+
+
 def log(line):
     stamp = datetime.now().strftime("%H:%M:%S")
     text = f"{stamp}  {line}"
-    print(text, flush=True)
-    try:
-        with open(LOG, "a", encoding="utf-8") as fh:
-            fh.write(text + "\n")
-    except OSError:
-        pass
+    with log_lock:
+        print(text, flush=True)
+        try:
+            with open(LOG, "a", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+        except OSError:
+            pass
 
 
 def load_library():
@@ -101,6 +112,20 @@ def public_key(private_text):
     return out.value.decode()
 
 
+def write_guac_key(key):
+    """Publish the guacamole-lite AES key. The guest reads it after /run."""
+    key = key.strip()
+    if len(key.encode("utf-8")) != 32:
+        raise RuntimeError("guacCryptKey must be 32 bytes")
+    fd = os.open(GUAC_CRYPT_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, key.encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.chmod(GUAC_CRYPT_FILE, 0o600)
+    log("guacamole key ready")
+
+
 def start_tunnel(private_text, peer_public):
     """Create the BoringTun session and lwIP. Safe to call once."""
     global TUNNEL, LWIP, PEER_PUBLIC
@@ -122,6 +147,10 @@ TUNNEL = None
 DST = ctypes.create_string_buffer(DST_SIZE)
 active_lock = threading.Lock()
 active_conn = None
+# lwIP and BoringTun are single-threaded. Only the session holder touches them.
+session_lock = threading.Lock()
+open_lock = threading.Lock()
+open_conns = set()
 
 
 def conf_value(text, section, key):
@@ -302,38 +331,47 @@ def tick():
 
 
 def handshake(conn):
-    data = b""
-    while b"\r\n\r\n" not in data:
-        chunk = conn.recv(4096)
-        if not chunk:
+    """Read one upgrade and answer it. A silent peer is closed."""
+    conn.settimeout(HANDSHAKE_TIMEOUT)
+    try:
+        data = b""
+        while b"\r\n\r\n" not in data:
+            try:
+                chunk = conn.recv(4096)
+            except TimeoutError:
+                log("websocket handshake timed out")
+                return False
+            if not chunk:
+                return False
+            data += chunk
+            if len(data) > 65536:
+                return False
+        header = data.split(b"\r\n\r\n", 1)[0].decode("iso-8859-1", "replace")
+        lines = header.split("\r\n")
+        fields = {}
+        for line in lines[1:]:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                fields[key.strip().lower()] = value.strip()
+        if fields.get("upgrade", "").lower() != "websocket":
             return False
-        data += chunk
-        if len(data) > 65536:
-            return False
-    header = data.split(b"\r\n\r\n", 1)[0].decode("iso-8859-1", "replace")
-    lines = header.split("\r\n")
-    fields = {}
-    for line in lines[1:]:
-        if ":" in line:
-            key, value = line.split(":", 1)
-            fields[key.strip().lower()] = value.strip()
-    if fields.get("upgrade", "").lower() != "websocket":
-        return False
-    key = fields.get("sec-websocket-key", "")
-    accept = base64.b64encode(hashlib.sha1((key + GUID).encode("ascii")).digest()).decode("ascii")
-    response = (
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Accept: {accept}\r\n"
-        "\r\n"
-    )
-    conn.sendall(response.encode("ascii"))
-    offered = fields.get("sec-websocket-protocol")
-    if offered:
-        log(f"websocket protocol {offered}")
-    log(f"websocket open  path={lines[0]}")
-    return True
+        key = fields.get("sec-websocket-key", "")
+        accept = base64.b64encode(hashlib.sha1((key + GUID).encode("ascii")).digest()).decode("ascii")
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n"
+            "\r\n"
+        )
+        conn.sendall(response.encode("ascii"))
+        offered = fields.get("sec-websocket-protocol")
+        if offered:
+            log(f"websocket protocol {offered}")
+        log(f"websocket open  path={lines[0]}")
+        return True
+    finally:
+        conn.settimeout(None)
 
 
 def recv_exact(conn, n):
@@ -381,33 +419,90 @@ def preview(payload):
     return shown
 
 
-def set_active(conn):
+def still_active(conn):
+    with active_lock:
+        return active_conn is conn
+
+
+def register(conn):
+    with open_lock:
+        open_conns.add(conn)
+
+
+def unregister(conn):
+    with open_lock:
+        open_conns.discard(conn)
+
+
+def take_session(conn):
+    """Make conn the WireGuard session and drop the previous socket."""
     global active_conn
     with active_lock:
+        old = active_conn
         active_conn = conn
+    if old is not None and old is not conn:
+        log("replacing websocket")
+        try:
+            old.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    # Released by serve() after the session loop. Do not hold active_lock here:
+    # the previous session still owns session_lock and checks active_conn.
+    session_lock.acquire()
 
 
 def close_active():
-    """Close the current WebSocket so the accept loop is idle before suspend."""
-    with active_lock:
-        conn = active_conn
-    if conn is None:
-        return
-    try:
-        conn.shutdown(socket.SHUT_RDWR)
-    except OSError:
-        pass
+    """Close every WebSocket so the VM can suspend with none in flight."""
+    with open_lock:
+        conns = list(open_conns)
+    for conn in conns:
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
     for _ in range(50):
-        with active_lock:
-            if active_conn is None:
+        with open_lock:
+            if not open_conns:
                 return
         time.sleep(0.01)
 
 
-def serve(conn, addr):
-    log(f"connected  {addr[0]}:{addr[1]}")
-    set_active(conn)
+def run_session(conn):
     session_logged = False
+    while still_active(conn):
+        for packet in tick():
+            send_frame(conn, 0x2, packet)
+        if LWIP is not None:
+            for packet in wireguard_frames(LWIP.poll()):
+                send_frame(conn, 0x2, packet)
+        if not session_logged and LIB.wireguard_handshake_age(TUNNEL) >= 0:
+            log("wireguard session up")
+            session_logged = True
+        ready, _, _ = select.select([conn], [], [], 0.02)
+        if not ready:
+            continue
+        opcode, payload = read_frame(conn)
+        if opcode == 0x8:
+            log(f"close  {len(payload)} bytes")
+            send_frame(conn, 0x8, payload[:2])
+            return
+        if opcode == 0x9:
+            send_frame(conn, 0xA, payload)
+            continue
+        if opcode == 0xA:
+            continue
+        if opcode != 0x2:
+            log(f"ignored opcode {opcode}  {len(payload)} bytes")
+            continue
+        log(f"binary  {len(payload)} bytes  {wg_kind(payload)}  {preview(payload)}")
+        for packet in consume(payload):
+            send_frame(conn, 0x2, packet)
+
+
+def serve(conn, addr):
+    global active_conn
+    log(f"connected  {addr[0]}:{addr[1]}")
+    register(conn)
     try:
         if TUNNEL is None or LWIP is None:
             log("websocket closed  tunnel not ready")
@@ -415,40 +510,21 @@ def serve(conn, addr):
         if not handshake(conn):
             log("websocket handshake failed")
             return
-        while True:
-            for packet in tick():
-                send_frame(conn, 0x2, packet)
-            if LWIP is not None:
-                for packet in wireguard_frames(LWIP.poll()):
-                    send_frame(conn, 0x2, packet)
-            if not session_logged and LIB.wireguard_handshake_age(TUNNEL) >= 0:
-                log("wireguard session up")
-                session_logged = True
-            ready, _, _ = select.select([conn], [], [], 0.1)
-            if not ready:
-                continue
-            opcode, payload = read_frame(conn)
-            if opcode == 0x8:
-                log(f"close  {len(payload)} bytes")
-                send_frame(conn, 0x8, payload[:2])
-                return
-            if opcode == 0x9:
-                send_frame(conn, 0xA, payload)
-                continue
-            if opcode == 0xA:
-                continue
-            if opcode != 0x2:
-                log(f"ignored opcode {opcode}  {len(payload)} bytes")
-                continue
-            log(f"binary  {len(payload)} bytes  {wg_kind(payload)}  {preview(payload)}")
-            for packet in consume(payload):
-                send_frame(conn, 0x2, packet)
+        take_session(conn)
+        try:
+            if still_active(conn):
+                run_session(conn)
+        finally:
+            session_lock.release()
     except ConnectionError:
         log("connection closed")
     except Exception as exc:
         log(f"error  {exc}")
     finally:
-        set_active(None)
+        with active_lock:
+            if active_conn is conn:
+                active_conn = None
+        unregister(conn)
         try:
             conn.close()
         except OSError:
@@ -475,6 +551,9 @@ def start_from_run(body):
     host_addr = payload.get("hostAddr")
     if host_addr:
         os.environ["WG_HOST_ADDR"] = str(host_addr)
+    guac_key = payload.get("guacCryptKey", "")
+    if guac_key:
+        write_guac_key(guac_key)
     if not private or not peer:
         raise RuntimeError("run payload needs serverPrivateKey and peerPublicKey")
     start_tunnel(private, peer)
@@ -534,6 +613,9 @@ def main():
     global LIB
     LIB = load_library()
     if not MICROVM:
+        guac_key = os.environ.get("GUAC_CRYPT_KEY", "")
+        if guac_key:
+            write_guac_key(guac_key)
         private = (ROOT / "server.key").read_text()
         start_tunnel(private, PEER_PUBLIC.decode())
         config = wireguard_peer_config()
@@ -553,9 +635,10 @@ def main():
     while True:
         conn, addr = sock.accept()
         try:
-            serve(conn, addr)
-        except Exception as exc:
-            log(f"session error  {exc}")
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        threading.Thread(target=serve, args=(conn, addr), daemon=True).start()
 
 
 if __name__ == "__main__":

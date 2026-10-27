@@ -41,7 +41,10 @@ def main():
         allowedPorts=[{"allPorts": {}}],
     )
     auth_token = token_response["authToken"]["X-aws-proxy-auth"]
-    print(f"./wstoudp -url wss://{endpoint}/ -token {auth_token}")
+    # print(f"./wstoudp -url wss://{endpoint}/ -token {auth_token}")
+    print(f"./sandbox hv up --network default --ws-url wss://{endpoint}/ --ws-token {auth_token}")
+
+
     # # authToken is already a dict of header name → value (e.g. {"X-aws-proxy-auth": "..."})
     # auth_headers = auth_token if isinstance(auth_token, dict) else {"X-aws-proxy-auth": auth_token}
     # print(f"Token created (expires in {TOKEN_EXPIRY_MINUTES} min).\n")
