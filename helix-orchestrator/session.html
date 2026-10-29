@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MicroVM RDP</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
+    #display { width: 100%; height: 100%; }
+    #status {
+      position: absolute; inset: 0; z-index: 3; margin: 0; display: grid; place-items: center;
+      padding: 24px; text-align: center; background: #111; color: #f4f4f4;
+      font: 16px/1.4 sans-serif;
+    }
+    #status[hidden] { display: none; }
+    #status p { margin: 0 auto; max-width: 36rem; }
+    #status button {
+      margin-top: 16px; border: 0; border-radius: 8px; padding: 10px 14px;
+      background: #7eb6ff; color: #0d1520; font: inherit; cursor: pointer;
+    }
+    #status button[hidden] { display: none; }
+    #status.is-error #status-text { color: #ff8d8d; }
+    #notice {
+      position: absolute; left: 12px; bottom: 12px; margin: 0; z-index: 2;
+      padding: 6px 10px; border-radius: 8px; background: rgba(0, 0, 0, 0.72);
+      color: #f4f4f4; font: 14px/1.4 sans-serif;
+    }
+    #notice[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <div id="display"></div>
+  <p id="notice" hidden></p>
+  <div id="status">
+    <div>
+      <p id="status-text">Waiting for the desktop…</p>
+      <button id="status-reload" type="button" hidden>Reload</button>
+    </div>
+  </div>
+  <script>
+    window.addEventListener("error", () => {
+      const text = document.getElementById("status-text");
+      const status = document.getElementById("status");
+      if (!text || !status || status.hidden) return;
+      if (text.textContent !== "Waiting for the desktop…") return;
+      text.textContent = "The remote desktop client failed to load.";
+      status.classList.add("is-error");
+      const reload = document.getElementById("status-reload");
+      if (reload) reload.hidden = false;
+    });
+  </script>
+  <script type="module">
+    import Guacamole from "https://cdn.jsdelivr.net/npm/guacamole-common-js@1.5.0/dist/esm/guacamole-common.js";
+
+    const token = __TOKEN_JSON__;
+    const wsUrl = __WS_URL_JSON__;
+    const protocols = __PROTOCOLS_JSON__;
+    const status = document.getElementById("status");
+    const statusText = document.getElementById("status-text");
+    const reloadBtn = document.getElementById("status-reload");
+    const notice = document.getElementById("notice");
+    const sampleCanvas = document.createElement("canvas");
+    sampleCanvas.width = 32;
+    sampleCanvas.height = 18;
+    const DESKTOP_WAIT_MS = 20000;
+    const STATUS_TEXT = {
+      256: "The server rejected part of the connection.",
+      512: "The remote desktop failed.",
+      513: "The desktop is busy.",
+      514: "The desktop stopped responding.",
+      515: "The desktop connection failed.",
+      516: "The desktop was not found.",
+      517: "The desktop is already connected.",
+      518: "The desktop closed the connection.",
+      519: "Could not reach the desktop.",
+      520: "The desktop is unavailable.",
+      521: "This desktop is already in use.",
+      522: "The session timed out.",
+      523: "The session was closed.",
+      768: "The connection request was rejected.",
+      769: "Sign-in was rejected.",
+      771: "Access was denied.",
+      776: "The connection timed out.",
+      781: "The desktop sent too much data.",
+      783: "The desktop sent data this browser cannot show.",
+      797: "Too many connections.",
+    };
+    let desktopReady = false;
+    let sessionFailed = false;
+    let userDisconnect = false;
+    let connectTimer = 0;
+    function describeStatus(value) {
+      const code = Number(value && value.code);
+      const raw = String((value && value.message) || "").trim();
+      const hasWords = /[A-Za-z]/.test(raw) && raw !== "Manually closed.";
+      const known = STATUS_TEXT[code];
+      if (hasWords && known && raw.toLowerCase() !== known.toLowerCase()) return known + " " + raw;
+      if (hasWords) return raw;
+      if (known) return known;
+      if (Number.isFinite(code) && code > 255) return "The session failed (" + code + ").";
+      return "The session failed.";
+    }
+    function show(text, isError) {
+      status.hidden = false;
+      statusText.textContent = text;
+      status.classList.toggle("is-error", Boolean(isError));
+      reloadBtn.hidden = !isError;
+    }
+    function fail(text) {
+      if (userDisconnect || sessionFailed) return;
+      sessionFailed = true;
+      clearTimeout(connectTimer);
+      notice.hidden = true;
+      show(text, true);
+      try {
+        client.disconnect();
+      } catch (error) {
+        // The tunnel may already be closed.
+      }
+    }
+    function desktopHasPixels(target) {
+      try {
+        const layer = target.getDefaultLayer();
+        const source = layer && layer.getCanvas();
+        if (!source || source.width < 2 || source.height < 2) return false;
+        const context = sampleCanvas.getContext("2d", { willReadFrequently: true });
+        if (!context) return false;
+        context.imageSmoothingEnabled = false;
+        context.clearRect(0, 0, sampleCanvas.width, sampleCanvas.height);
+        context.drawImage(source, 0, 0, sampleCanvas.width, sampleCanvas.height);
+        const data = context.getImageData(0, 0, sampleCanvas.width, sampleCanvas.height).data;
+        let hits = 0;
+        for (let i = 0; i < data.length; i += 4) {
+          if (data[i + 3] < 16) continue;
+          if (data[i] > 16 || data[i + 1] > 16 || data[i + 2] > 16) hits += 1;
+          if (hits >= 2) return true;
+        }
+        return false;
+      } catch (error) {
+        return false;
+      }
+    }
+
+    // WebSocketTunnel offers only "guacamole". Offer the MicroVM auth and
+    // port subprotocols for that one constructor call.
+    const NativeWebSocket = window.WebSocket;
+    function TunnelWebSocket(url, protocol) {
+      const selected = protocol === "guacamole" ? protocols : protocol;
+      return new NativeWebSocket(url, selected);
+    }
+    TunnelWebSocket.prototype = NativeWebSocket.prototype;
+    TunnelWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
+    TunnelWebSocket.OPEN = NativeWebSocket.OPEN;
+    TunnelWebSocket.CLOSING = NativeWebSocket.CLOSING;
+    TunnelWebSocket.CLOSED = NativeWebSocket.CLOSED;
+
+    const tunnel = new Guacamole.WebSocketTunnel(wsUrl);
+    const connectTunnel = tunnel.connect.bind(tunnel);
+    tunnel.connect = (data) => {
+      const previous = window.WebSocket;
+      window.WebSocket = TunnelWebSocket;
+      try {
+        return connectTunnel(data);
+      } finally {
+        window.WebSocket = previous;
+      }
+    };
+    const client = new Guacamole.Client(tunnel);
+    const display = client.getDisplay();
+    const el = display.getElement();
+    document.getElementById("display").appendChild(el);
+
+    function fit() {
+      try {
+        const width = display.getWidth();
+        const height = display.getHeight();
+        if (!width || !height) return;
+        display.scale(Math.min(window.innerWidth / width, window.innerHeight / height));
+      } catch (error) {
+        fail("The connection closed.");
+      }
+    }
+    display.onresize = fit;
+
+    tunnel.onerror = (value) => {
+      if (value && Number(value.code) === 0) return;
+      fail(describeStatus(value));
+    };
+    tunnel.onstatechange = (state) => {
+      if (state === Guacamole.Tunnel.State.OPEN) {
+        notice.hidden = true;
+        return;
+      }
+      if (state === Guacamole.Tunnel.State.UNSTABLE) {
+        if (!sessionFailed && desktopReady) {
+          notice.textContent = "The connection is unstable.";
+          notice.hidden = false;
+        }
+        return;
+      }
+      if (state === Guacamole.Tunnel.State.CLOSED) fail("The connection closed.");
+    };
+    client.onerror = (value) => fail(describeStatus(value));
+    client.onstatechange = (state) => {
+      if (state === Guacamole.Client.State.CONNECTED && !sessionFailed) {
+        try {
+          client.sendSize(window.innerWidth, window.innerHeight);
+        } catch (error) {
+          fail("The connection closed.");
+        }
+      } else if (state === Guacamole.Client.State.DISCONNECTED) {
+        fail("The connection closed.");
+      }
+    };
+    client.onsync = () => {
+      if (sessionFailed || userDisconnect) return;
+      fit();
+      if (desktopReady || !desktopHasPixels(display)) return;
+      desktopReady = true;
+      clearTimeout(connectTimer);
+      status.hidden = true;
+    };
+
+    const mouse = new Guacamole.Mouse(el);
+    mouse.onmousedown = mouse.onmouseup = mouse.onmousemove = (pointer) => {
+      if (sessionFailed) return;
+      try {
+        client.sendMouseState(pointer);
+      } catch (error) {
+        fail("The connection closed.");
+      }
+    };
+    const keyboard = new Guacamole.Keyboard(document);
+    keyboard.onkeydown = (keysym) => {
+      if (sessionFailed) return;
+      try {
+        client.sendKeyEvent(1, keysym);
+      } catch (error) {
+        fail("The connection closed.");
+      }
+    };
+    keyboard.onkeyup = (keysym) => {
+      if (sessionFailed) return;
+      try {
+        client.sendKeyEvent(0, keysym);
+      } catch (error) {
+        fail("The connection closed.");
+      }
+    };
+
+    let resizeTimer = 0;
+    window.addEventListener("resize", () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (sessionFailed) return;
+        try {
+          client.sendSize(window.innerWidth, window.innerHeight);
+        } catch (error) {
+          fail("The connection closed.");
+        }
+      }, 200);
+    });
+    reloadBtn.addEventListener("click", () => window.location.reload());
+    window.addEventListener("beforeunload", () => {
+      userDisconnect = true;
+      try {
+        client.disconnect();
+      } catch (error) {
+        // The page is going away.
+      }
+    });
+    connectTimer = window.setTimeout(() => {
+      if (userDisconnect || sessionFailed || desktopReady) return;
+      if (!tunnel.isConnected()) {
+        fail("Could not open the connection.");
+        return;
+      }
+      show("The connection is up, but the desktop has not appeared yet.");
+    }, DESKTOP_WAIT_MS);
+    try {
+      client.connect("token=" + encodeURIComponent(token));
+    } catch (error) {
+      fail(describeStatus(error));
+    }
+  </script>
+</body>
+</html>

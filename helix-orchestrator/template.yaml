@@ -1,0 +1,394 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Helix orchestrator as a Lambda Function URL, plus the MicroVM image this
+  repo runs. The function reaches DynamoDB directly. Its role can run that
+  image through the Lambda MicroVM API.
+
+Parameters:
+  CodeBucket:
+    Type: String
+    Description: S3 bucket, in this stack's Region, that holds bootstrap.zip.
+  CodeKey:
+    Type: String
+    Default: helix-orchestrator/bootstrap.zip
+    Description: S3 key of the linux/arm64 zip produced by make zip.
+  FunctionName:
+    Type: String
+    Default: helix-orchestrator
+  TableName:
+    Type: String
+    Default: helix-orchestrator
+  AdminUser:
+    Type: String
+    Default: admin
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    Description: Admin UI password. The Function URL is public; this password and the API keys are the gates.
+  BillingMode:
+    Type: String
+    Default: PROVISIONED
+    AllowedValues:
+      - PROVISIONED
+      - PAY_PER_REQUEST
+    Description: PROVISIONED at 5/5 stays inside the DynamoDB free tier. Use PAY_PER_REQUEST if a poll starts throttling.
+  ReadCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+  WriteCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+  MemorySize:
+    Type: Number
+    Default: 1769
+    MinValue: 128
+    MaxValue: 10240
+    Description: 1769 MB is one full vCPU. The function handles one request at a time, so extra memory does not add concurrency.
+  ImageName:
+    Type: String
+    Default: helix-wg-host
+    AllowedPattern: "[a-zA-Z0-9-_]+"
+    ConstraintDescription: Letters, numbers, hyphens, and underscores, up to 64 characters.
+    MaxLength: 64
+    Description: MicroVM image name. Set this to my-first-microvm-image to target the image scripts/03_create_image.py builds.
+  BuildImage:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Create the MicroVM image in this stack. app.zip must already be in the artifact bucket.
+  GuestArtifactBucket:
+    Type: String
+    Default: ""
+    Description: Bucket that already holds the guest zip. Empty uses the bucket this stack creates.
+  GuestArtifactKey:
+    Type: String
+    Default: app.zip
+  MicrovmMemory:
+    Type: Number
+    Default: 2048
+    AllowedValues:
+      - 512
+      - 1024
+      - 2048
+      - 4096
+      - 8192
+    Description: Baseline memory in MiB. 2048 is one vCPU. The guest libraries are aarch64.
+  MaxIdleSeconds:
+    Type: Number
+    Default: 900
+    Description: Idle time before the platform suspends a MicroVM. Passed to RunMicrovm, matching config.py.
+  SuspendedSeconds:
+    Type: Number
+    Default: 300
+    Description: Suspended time before the platform terminates a MicroVM.
+  WireGuardPrivateKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Guest server private key. Sent only in the RunMicrovm hook. Empty still starts the MicroVM; the tunnel hook then fails.
+  WireGuardPeerPublicKey:
+    Type: String
+    Default: "GHhBnw7IqG3OcOcjH7lE3xXVOsNLH64SWpofim1wkE8="
+    Description: Peer public key delivered with the run hook. The default matches windows-dummy.conf.
+  GuacRdpUser:
+    Type: String
+    Default: ""
+    Description: Windows user Launch Student publishes, matching GUAC_RDP_USER in scripts/spawn.py.
+  GuacRdpPassword:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Windows password Launch Student publishes, matching GUAC_RDP_PASSWORD in scripts/spawn.py.
+
+Conditions:
+  IsProvisioned: !Equals [!Ref BillingMode, PROVISIONED]
+  BuildTheImage: !Equals [!Ref BuildImage, "true"]
+  UseStackBucket: !Equals [!Ref GuestArtifactBucket, ""]
+
+Resources:
+  Table:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: !Ref BillingMode
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      ProvisionedThroughput: !If
+        - IsProvisioned
+        - ReadCapacityUnits: !Ref ReadCapacity
+          WriteCapacityUnits: !Ref WriteCapacity
+        - !Ref AWS::NoValue
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+      DeletionProtectionEnabled: false
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${FunctionName}
+      RetentionInDays: 14
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt LogGroup.Arn
+                  - !Sub ${LogGroup.Arn}:*
+        - PolicyName: dynamodb
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:TransactWriteItems
+                Resource: !GetAtt Table.Arn
+        - PolicyName: microvm
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SpawnThisImage
+                Effect: Allow
+                Action:
+                  - lambda:RunMicrovm
+                  - lambda:GetMicrovm
+                  - lambda:CreateMicrovmAuthToken
+                  - lambda:TerminateMicrovm
+                  - lambda:GetMicrovmImage
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ImageName}
+              - Sid: ListMicrovms
+                Effect: Allow
+                Action: lambda:ListMicrovms
+                Resource: "*"
+              - Sid: PassManagedConnectors
+                Effect: Allow
+                Action: lambda:PassNetworkConnector
+                Resource:
+                  - !Sub arn:aws:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:ALL_INGRESS
+                  - !Sub arn:aws:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  MicrovmLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/microvms/${ImageName}
+      RetentionInDays: 14
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      Policies:
+        - PolicyName: MicrovmBuildPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub ${ArtifactBucket.Arn}/*
+                  - !If
+                    - UseStackBucket
+                    - !Sub ${ArtifactBucket.Arn}/*
+                    - !Sub arn:aws:s3:::${GuestArtifactBucket}/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt MicrovmLogGroup.Arn
+                  - !Sub ${MicrovmLogGroup.Arn}:*
+
+  MicrovmImage:
+    Type: AWS::Lambda::MicrovmImage
+    Condition: BuildTheImage
+    DependsOn: MicrovmLogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Ref ImageName
+      Description: WireGuard guest from this repo. Keys arrive in the run hook, not in the image.
+      BaseImageArn: !Sub arn:aws:lambda:${AWS::Region}:aws:microvm-image:al2023-1
+      BuildRoleArn: !GetAtt BuildRole.Arn
+      CodeArtifact:
+        Uri: !Sub
+          - s3://${Bucket}/${Key}
+          - Bucket: !If [UseStackBucket, !Ref ArtifactBucket, !Ref GuestArtifactBucket]
+            Key: !Ref GuestArtifactKey
+      CpuConfigurations:
+        - Architecture: ARM_64
+      Resources:
+        - MinimumMemoryInMiB: !Ref MicrovmMemory
+      AdditionalOsCapabilities:
+        - ALL
+      EgressNetworkConnectors:
+        - !Sub arn:aws:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS
+      EnvironmentVariables:
+        - Key: WG_HOST_MODE
+          Value: microvm
+      Hooks:
+        Port: 9000
+        MicrovmImageHooks:
+          Ready: ENABLED
+          ReadyTimeoutInSeconds: 60
+          Validate: ENABLED
+          ValidateTimeoutInSeconds: 30
+        MicrovmHooks:
+          Run: ENABLED
+          RunTimeoutInSeconds: 10
+          Resume: ENABLED
+          ResumeTimeoutInSeconds: 10
+          Suspend: ENABLED
+          SuspendTimeoutInSeconds: 10
+          Terminate: ENABLED
+          TerminateTimeoutInSeconds: 10
+      Logging:
+        CloudWatch:
+          LogGroup: !Ref MicrovmLogGroup
+
+  Function:
+    Type: AWS::Lambda::Function
+    DependsOn: LogGroup
+    Properties:
+      FunctionName: !Ref FunctionName
+      Description: Helix orchestrator HTTP API
+      Runtime: provided.al2023
+      Architectures:
+        - arm64
+      Handler: bootstrap
+      MemorySize: !Ref MemorySize
+      Timeout: 15
+      Role: !GetAtt Role.Arn
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:753240598075:layer:LambdaAdapterLayerArm64:30
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref Table
+          ADMIN_USER: !Ref AdminUser
+          ADMIN_PASSWORD: !Ref AdminPassword
+          MICROVM_IMAGE_ARN: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ImageName}
+          MICROVM_INGRESS_CONNECTOR: !Sub arn:aws:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:ALL_INGRESS
+          MICROVM_EGRESS_CONNECTOR: !Sub arn:aws:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS
+          MICROVM_MAX_IDLE_SECONDS: !Sub "${MaxIdleSeconds}"
+          MICROVM_SUSPENDED_SECONDS: !Sub "${SuspendedSeconds}"
+          WG_SERVER_PRIVATE_KEY: !Ref WireGuardPrivateKey
+          WG_PEER_PUBLIC_KEY: !Ref WireGuardPeerPublicKey
+          GUAC_RDP_USER: !Ref GuacRdpUser
+          GUAC_RDP_PASSWORD: !Ref GuacRdpPassword
+          PORT: "8080"
+          AWS_LWA_PORT: "8080"
+          AWS_LWA_READINESS_CHECK_PATH: /healthz
+          AWS_LWA_INVOKE_MODE: buffered
+          AWS_LWA_ENABLE_COMPRESSION: "true"
+      LoggingConfig:
+        LogGroup: !Ref LogGroup
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+
+  Url:
+    Type: AWS::Lambda::Url
+    DependsOn:
+      - PublicInvokeUrl
+      - PublicInvokeFunction
+    Properties:
+      TargetFunctionArn: !GetAtt Function.Arn
+      AuthType: NONE
+      InvokeMode: BUFFERED
+
+  PublicInvokeUrl:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  PublicInvokeFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+Outputs:
+  FunctionUrl:
+    Description: HTTPS origin for the admin UI and the queue API.
+    Value: !GetAtt Url.FunctionUrl
+  FunctionArn:
+    Value: !GetAtt Function.Arn
+  TableName:
+    Value: !Ref Table
+  TableArn:
+    Value: !GetAtt Table.Arn
+  ArtifactBucketName:
+    Description: Upload app.zip here before setting BuildImage to true, unless GuestArtifactBucket is set.
+    Value: !If [UseStackBucket, !Ref ArtifactBucket, !Ref GuestArtifactBucket]
+  MicrovmImageArn:
+    Description: Image RunMicrovm starts. The function role is limited to this ARN.
+    Value: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ImageName}
+  BuildRoleArn:
+    Value: !GetAtt BuildRole.Arn
