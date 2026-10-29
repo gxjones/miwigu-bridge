@@ -1,6 +1,7 @@
 .env
 creds.txt
 state.json
+spawned.json
 app.zip
 __pycache__/
 *.pyc
