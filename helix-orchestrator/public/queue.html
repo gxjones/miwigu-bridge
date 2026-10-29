@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Queue</title>
+  <link rel="stylesheet" href="/style.css?v=11">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">Admin</p>
+      <h1>Queue</h1>
+    </div>
+    <nav class="nav">
+      <a href="/microvm">MicroVM</a>
+      <a href="/keys">Keys</a>
+      <a href="/launch">Launch</a>
+      <button id="logout" class="secondary" type="button">Log out</button>
+    </nav>
+  </header>
+  <main>
+    <p id="error" class="error" hidden></p>
+    <table>
+      <thead>
+        <tr><th>OS</th><th>UID</th><th>Status</th><th>Updated</th><th>Result</th><th></th></tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p id="empty" class="mono" hidden>Queue is empty.</p>
+  </main>
+  <script src="/nav.js?v=1"></script>
+  <script src="/queue.js?v=3"></script>
+</body>
+</html>

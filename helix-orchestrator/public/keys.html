@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>API keys</title>
+  <link rel="stylesheet" href="/style.css?v=8">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">Admin</p>
+      <h1>API keys</h1>
+    </div>
+    <nav class="nav">
+      <a href="/microvm">MicroVM</a>
+      <a href="/queue">Queue</a>
+      <a href="/launch">Launch</a>
+      <button id="logout" class="secondary" type="button">Log out</button>
+    </nav>
+  </header>
+  <main>
+    <form id="create" class="card">
+      <h2>New key</h2>
+      <p>The secret is shown once. User keys queue VMs. Worker keys claim and finish them.</p>
+      <div class="key-actions">
+        <label>Name <input name="name" autocomplete="off" maxlength="64"></label>
+        <button type="submit" data-role="user">User key</button>
+        <button type="submit" data-role="worker" class="secondary">Worker key</button>
+      </div>
+      <p id="secret" class="mono" hidden></p>
+    </form>
+    <p id="error" class="error" hidden></p>
+    <table>
+      <thead>
+        <tr><th>Role</th><th>Name</th><th>Prefix</th><th>Created</th><th></th></tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </main>
+  <script src="/nav.js?v=1"></script>
+  <script src="/keys.js?v=1"></script>
+</body>
+</html>

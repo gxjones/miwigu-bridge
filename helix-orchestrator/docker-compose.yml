@@ -1,0 +1,23 @@
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "127.0.0.1:8000:8000"
+  web:
+    build:
+      context: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8099:8099"
+    environment:
+      PORT: "8099"
+      DYNAMODB_TABLE: helix
+      DYNAMODB_ENDPOINT: http://dynamodb:8000
+      AWS_REGION: us-east-1
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      GUAC_RDP_USER: ${GUAC_RDP_USER:-}
+      GUAC_RDP_PASSWORD: ${GUAC_RDP_PASSWORD:-}
+    depends_on:
+      - dynamodb
