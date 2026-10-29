@@ -1,0 +1,7 @@
+{
+  "name": "wg-host-guac",
+  "private": true,
+  "dependencies": {
+    "guacamole-lite": "1.2.0"
+  }
+}

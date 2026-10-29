@@ -100,7 +100,19 @@ python scripts/05_connect.py          # print: ./wstoudp -url wss://... -token .
 python scripts/06_terminate.py        # terminate and delete state.json
 ```
 
-Script 04 reads `server.key` and waits until the MicroVM is `RUNNING`. Script 05 prints a `wstoudp` command with a fresh auth token. Start `wstoudp` with that command, bring up a WireGuard peer for `10.200.99.2` whose endpoint is `127.0.0.1:51820`, then request `http://10.200.99.1/`.
+Script 04 reads `server.key` and waits until the MicroVM is `RUNNING`. It also writes a guacamole-lite key into `state.json`. Script 05 prints a `wstoudp` command with a fresh auth token. Start `wstoudp` with that command, bring up a WireGuard peer for `10.200.99.2` whose endpoint is `127.0.0.1:51820`, then request `http://10.200.99.1/`.
+
+## Remote desktop
+
+The same tunnel carries RDP to that peer. The guest listens on `127.0.0.1:3389`. guacd connects there, and lwIP dials `10.200.99.2:3389`. guacamole-lite listens on port 8081. The page opens that WebSocket itself. A browser cannot set the MicroVM auth headers, so the socket offers `lambda-microvms.authentication.<token>` and `lambda-microvms.port.8081` as subprotocols:
+
+```bash
+GUAC_RDP_USER=Administrator GUAC_RDP_PASSWORD=secret python scripts/08_guacamole.py
+```
+
+Bring the WireGuard tunnel up first. Windows has to accept RDP from `10.200.99.1`. The page opens at `http://127.0.0.1:8766/`.
+
+`WG_DIAL_LISTEN` and `WG_DIAL_DEST` change the splice (`host:port`). Set `WG_DIAL_LISTEN=off` to disable it.
 
 `config.py` suspends the MicroVM after 15 minutes idle and resumes it when traffic arrives. A MicroVM that stays suspended for 5 minutes is terminated.
 
@@ -116,7 +128,14 @@ RUNNING / SUSPENDED → TERMINATING → TERMINATED
 
 ```bash
 docker build -f local/Dockerfile -t local-runner .
-docker run --rm -p 8080:8080 local-runner
+docker run --rm -p 8080:8080 -p 8081:8081 local-runner
+```
+
+The container prints a `guac crypt key`. With the tunnel up:
+
+```bash
+GUAC_RDP_USER=Administrator GUAC_RDP_PASSWORD=secret \
+  python scripts/08_guacamole.py --local --key '<key>'
 ```
 
 The listener prints a WireGuard client config. Point `wstoudp` at `ws://127.0.0.1:8080/` and use that config, whose endpoint is `127.0.0.1:51820`.

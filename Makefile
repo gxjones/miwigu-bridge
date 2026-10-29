@@ -81,6 +81,8 @@ $(DIST)/%/libtunn_ffi.so: $(TUNN_SRCS)
 
 # Keep in sync with FILES_TO_ZIP in scripts/02_upload_artifact.py.
 ARTIFACT_FILES := Dockerfile wg_host_listener.py success_server.py ssh_server.py start.sh \
+	install-guacd.sh patches/guacamole-2328-1.6.0.patch \
+	guac/package.json guac/package-lock.json guac/server.js \
 	dist/$(GUEST_TARGET)/libtunn_ffi.so dist/$(GUEST_TARGET)/liblwip_port.so
 
 artifact: app.zip

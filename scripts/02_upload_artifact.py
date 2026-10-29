@@ -27,6 +27,11 @@ FILES_TO_ZIP = [
     "success_server.py",
     "ssh_server.py",
     "start.sh",
+    "install-guacd.sh",
+    "patches/guacamole-2328-1.6.0.patch",
+    "guac/package.json",
+    "guac/package-lock.json",
+    "guac/server.js",
     "dist/aarch64-unknown-linux-gnu/libtunn_ffi.so",
     "dist/aarch64-unknown-linux-gnu/liblwip_port.so",
 ]

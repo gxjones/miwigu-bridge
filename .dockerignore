@@ -1,0 +1,8 @@
+.git
+.venv
+backup
+**/__pycache__
+**/*.pyc
+miwigu/wg_host/tunn_ffi/target
+miwigu/wg_host/dist
+**/*.log
