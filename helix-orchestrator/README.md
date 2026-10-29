@@ -15,7 +15,7 @@ One DynamoDB table, partition key `pk`, sort key `sk`. No secondary indexes.
 | Viewer login | `login#<username>` | `A` | access is published |
 | Queued, one OS | `queue#<os>` | `<createdAt>#<uid>` | `status` is `queued` |
 | Queued, any OS | `queue` | `<createdAt>#<os>#<uid>` | `status` is `queued` |
-| Launched MicroVM | `microvm#<id>` | `A` | Launch Student has started it |
+| Launched MicroVM | `microvm#<id>` | `A` | a launch has started it |
 
 A claim is one query of the oldest queue row, then a transaction that deletes both queue rows and sets the request to `pending`. Two workers can claim at once; one transaction wins. A deleted request is `status = deleted` on `req#<uid>`. There is no separate deleted list.
 
@@ -75,7 +75,7 @@ The same template creates the guest image `scripts/03_create_image.py` builds, a
 
 The orchestrator role can call `RunMicrovm`, `GetMicrovm`, `CreateMicrovmAuthToken`, and `TerminateMicrovm` on that image only, and it can pass the managed ingress and internet-egress connectors. The function environment holds the image ARN, those connector ARNs, and the idle times from `config.py` (15 minutes idle, then 5 minutes suspended).
 
-Launch Student calls `RunMicrovm` with that image, both connectors, and the idle policy, then writes `microvm#<id>`. The row keeps the id, endpoint, websocket URL, region, state, image, start time, auth token, and the guacamole key when the run hook was sent. The page asks `GetMicrovm` until the guest is `RUNNING`. `RunMicrovm` returns before the guest is `RUNNING`, and the function does not wait out that boot. Once the guest is `RUNNING`, Launch Student does what `scripts/spawn.py` does next: it queues a Windows VM with the websocket URL and auth token, then publishes the desktop with `GUAC_RDP_USER`, `GUAC_RDP_PASSWORD`, and the guacamole key. The page then opens `/microvm` with the generated username and password. Set both variables in the environment or `.env` before `make up`. `WireGuardPrivateKey` is the guest key sent in the run hook. Without it the MicroVM still starts, the tunnel hook fails, and the desktop is not published.
+The launch page calls `RunMicrovm` with that image, both connectors, and the idle policy, then writes `microvm#<id>`. The row keeps the id, endpoint, websocket URL, region, state, image, start time, auth token, and the guacamole key when the run hook was sent. The page asks `GetMicrovm` until the guest is `RUNNING`. `RunMicrovm` returns before the guest is `RUNNING`, and the function does not wait out that boot. Once the guest is `RUNNING`, the launch page does what `scripts/spawn.py` does next: it queues a Windows VM with the websocket URL and auth token, then publishes the desktop with `GUAC_RDP_USER`, `GUAC_RDP_PASSWORD`, and the guacamole key. The page then opens `/microvm` with the generated username and password. Set both variables in the environment or `.env` before `make up`. `WireGuardPrivateKey` is the guest key sent in the run hook. Without it the MicroVM still starts, the tunnel hook fails, and the desktop is not published.
 
 `BuildImage` defaults to `false`, so a deploy does not wait on a guest build. The stack still creates the artifact bucket. Upload the guest zip, then deploy again with the image enabled:
 

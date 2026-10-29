@@ -97,12 +97,12 @@ Parameters:
   GuacRdpUser:
     Type: String
     Default: ""
-    Description: Windows user Launch Student publishes, matching GUAC_RDP_USER in scripts/spawn.py.
+    Description: Windows user the launch page publishes, matching GUAC_RDP_USER in scripts/spawn.py.
   GuacRdpPassword:
     Type: String
     Default: ""
     NoEcho: true
-    Description: Windows password Launch Student publishes, matching GUAC_RDP_PASSWORD in scripts/spawn.py.
+    Description: Windows password the launch page publishes, matching GUAC_RDP_PASSWORD in scripts/spawn.py.
 
 Conditions:
   IsProvisioned: !Equals [!Ref BillingMode, PROVISIONED]

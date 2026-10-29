@@ -64,13 +64,13 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/admin/keys", s.createKey)
 	mux.HandleFunc("DELETE /api/admin/keys/{id}", s.admin(s.deleteKey))
 	mux.HandleFunc("GET /api/admin/queue", s.admin(s.queue))
-	mux.HandleFunc("POST /api/admin/launch", s.admin(s.launchStudent))
+	mux.HandleFunc("POST /api/admin/launch", s.admin(s.launch))
 	mux.HandleFunc("GET /api/admin/microvms", s.admin(s.listMicrovms))
-	mux.HandleFunc("GET /api/admin/microvms/{id}", s.admin(s.studentMicrovm))
+	mux.HandleFunc("GET /api/admin/microvms/{id}", s.admin(s.getMicrovm))
 	mux.HandleFunc("GET /{$}", s.admin(s.home))
 	mux.HandleFunc("GET /queue", s.admin(s.page("queue.html")))
 	mux.HandleFunc("GET /keys", s.admin(s.page("keys.html")))
-	mux.HandleFunc("GET /launch-student", s.admin(s.page("launch-student.html")))
+	mux.HandleFunc("GET /launch", s.admin(s.page("launch.html")))
 
 	sub, err := fs.Sub(publicFS, "public")
 	if err != nil {
@@ -418,7 +418,7 @@ func (s *server) queue(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.store.ListRequests())
 }
 
-func (s *server) launchStudent(w http.ResponseWriter, r *http.Request) {
+func (s *server) launch(w http.ResponseWriter, r *http.Request) {
 	if s.vms == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "microvm image is not configured"})
 		return
@@ -475,7 +475,7 @@ func (s *server) listMicrovms(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, rows)
 }
 
-func (s *server) studentMicrovm(w http.ResponseWriter, r *http.Request) {
+func (s *server) getMicrovm(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	rec, ok, err := s.store.GetMicrovm(id)
 	if err != nil {
@@ -519,7 +519,7 @@ func (s *server) studentMicrovm(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, next)
 }
 
-// launchOwner is the user-key id stored on a desktop queued by Launch Student.
+// launchOwner is the user-key id stored on a desktop queued from the launch page.
 // The worker claim does not check it. The admin queue lists the request.
 const launchOwner = "launch"
 

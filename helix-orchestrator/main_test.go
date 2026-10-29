@@ -173,16 +173,16 @@ func TestAPIContract(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Queue") {
 		t.Fatalf("queue page: %d", rec.Code)
 	}
-	rec = call(mux, http.MethodGet, "/launch-student", "", "")
+	rec = call(mux, http.MethodGet, "/launch", "", "")
 	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/login" {
-		t.Fatalf("launch student redirect: %d %s", rec.Code, rec.Header().Get("Location"))
+		t.Fatalf("launch redirect: %d %s", rec.Code, rec.Header().Get("Location"))
 	}
-	req = httptest.NewRequest(http.MethodGet, "/launch-student", nil)
+	req = httptest.NewRequest(http.MethodGet, "/launch", nil)
 	req.AddCookie(cookie)
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Launch Student") || !strings.Contains(rec.Body.String(), ">Launch<") || strings.Contains(rec.Body.String(), "<table") {
-		t.Fatalf("launch student page: %d %s", rec.Code, rec.Body)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<h1>Launch</h1>") || !strings.Contains(rec.Body.String(), ">Launch<") || strings.Contains(rec.Body.String(), "<table") {
+		t.Fatalf("launch page: %d %s", rec.Code, rec.Body)
 	}
 	req = httptest.NewRequest(http.MethodGet, "/style.css", nil)
 	req.AddCookie(cookie)
@@ -221,7 +221,7 @@ func (s *scriptedVMs) AuthToken(context.Context, string) (string, error) {
 	return s.token, nil
 }
 
-func TestLaunchStudent(t *testing.T) {
+func TestLaunch(t *testing.T) {
 	app := testApp(t)
 	mux := app.routes()
 	rec := call(mux, http.MethodPost, "/api/admin/launch", "", "")
